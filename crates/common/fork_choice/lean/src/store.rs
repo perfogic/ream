@@ -1076,7 +1076,12 @@ impl Store {
         let mut processed_attestation_data: HashSet<AttestationData> = HashSet::new();
 
         let mut sorted_candidates: Vec<_> = ctx.available_signed_attestations.values().collect();
-        sorted_candidates.sort_by_key(|signed_attestation| signed_attestation.message.target.slot);
+        sorted_candidates.sort_by_cached_key(|signed_attestation| {
+            (
+                signed_attestation.message.target.slot,
+                signed_attestation.message.tree_hash_root(),
+            )
+        });
 
         let select_start = Instant::now();
         let mut child_payloads_consumed = 0;
@@ -1979,29 +1984,30 @@ impl Store {
         &self,
         aggregated_payloads: &HashMap<SignatureKey, Vec<PayloadProof>>,
     ) -> anyhow::Result<HashMap<u64, AttestationData>> {
-        let mut attestations: HashMap<u64, AttestationData> = HashMap::new();
         let attestation_data_by_root_provider =
             self.store.lock().await.attestation_data_by_root_provider();
+        let mut resolved_attestations = Vec::with_capacity(aggregated_payloads.len());
 
         for (signature_key, proofs) in aggregated_payloads {
-            let data_root = signature_key.data_root;
-            let attestation_data = match attestation_data_by_root_provider.get(data_root)? {
-                Some(data) => data,
-                None => continue,
-            };
-
             if proofs.is_empty() {
                 continue;
             }
 
-            let validator = signature_key.validator_id;
-            let is_newer = attestations
-                .get(&validator)
-                .is_none_or(|existing| existing.slot < attestation_data.slot);
+            let data_root = signature_key.data_root;
+            let Some(attestation_data) = attestation_data_by_root_provider.get(data_root)? else {
+                continue;
+            };
 
-            if is_newer {
-                attestations.insert(validator, attestation_data.clone());
-            }
+            resolved_attestations.push((signature_key.validator_id, data_root, attestation_data));
+        }
+
+        resolved_attestations.sort_by_key(|(_validator_id, data_root, data)| {
+            std::cmp::Reverse((data.slot, *data_root))
+        });
+
+        let mut attestations: HashMap<u64, AttestationData> = HashMap::new();
+        for (validator_id, _data_root, attestation_data) in resolved_attestations {
+            attestations.entry(validator_id).or_insert(attestation_data);
         }
         Ok(attestations)
     }
@@ -2755,4 +2761,294 @@ fn compact_aggregated_proofs(
     }
 
     Ok((out_attestations, out_proofs))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use alloy_primitives::B256;
+    use ream_consensus_lean::{
+        attestation::{
+            AttestationData, MultiMessageAggregate, SignatureKey, SingleMessageAggregate,
+        },
+        block::{Block, BlockBody, SignedBlock},
+        checkpoint::Checkpoint,
+    };
+    use ream_consensus_misc::constants::lean::INTERVALS_PER_SLOT;
+    use ream_storage::tables::{field::REDBField, table::REDBTable};
+    use ream_test_utils::store::sample_store;
+    use ssz_types::{
+        BitList, VariableList,
+        typenum::{U4096, U524288},
+    };
+    use tree_hash::TreeHash;
+
+    use super::{BlockProductionStrategy, Store};
+
+    async fn sample_store_as_store(no_of_validators: usize) -> Store {
+        let test_store = sample_store(no_of_validators).await;
+        Store {
+            store: test_store.store,
+            network_state: test_store.network_state,
+            tick_interval_duration: None,
+            block_production_strategy: BlockProductionStrategy::default(),
+        }
+    }
+
+    fn make_test_aggregated_proof(participants: &[u64]) -> SingleMessageAggregate {
+        let mut aggregation_bits = BitList::<U4096>::with_capacity(
+            participants.iter().max().map_or(0, |m| *m as usize + 1),
+        )
+        .expect("test aggregation bits should fit");
+
+        for validator_id in participants {
+            aggregation_bits
+                .set(*validator_id as usize, true)
+                .expect("test validator id should fit");
+        }
+
+        SingleMessageAggregate::new(
+            aggregation_bits,
+            VariableList::<u8, U524288>::new(vec![0u8]).expect("test proof should fit"),
+        )
+    }
+
+    fn make_attestation_data_with_root(slot: u64, target_slot: u64, root: B256) -> AttestationData {
+        AttestationData {
+            slot,
+            head: Checkpoint {
+                root,
+                slot: target_slot,
+            },
+            target: Checkpoint {
+                root,
+                slot: target_slot,
+            },
+            source: Checkpoint {
+                root: B256::ZERO,
+                slot: 0,
+            },
+        }
+    }
+
+    fn ordered_by_data_root(slot: u64, target_slot: u64) -> (AttestationData, AttestationData) {
+        let first = make_attestation_data_with_root(slot, target_slot, B256::repeat_byte(0x11));
+        let second = make_attestation_data_with_root(slot, target_slot, B256::repeat_byte(0x22));
+
+        if first.tree_hash_root() < second.tree_hash_root() {
+            (first, second)
+        } else {
+            (second, first)
+        }
+    }
+
+    fn lower_slot_larger_root_pair() -> (AttestationData, AttestationData) {
+        for lower_root_byte in 0u8..=u8::MAX {
+            for higher_root_byte in 0u8..=u8::MAX {
+                let lower_slot_data =
+                    make_attestation_data_with_root(5, 5, B256::repeat_byte(lower_root_byte));
+                let higher_slot_data =
+                    make_attestation_data_with_root(6, 6, B256::repeat_byte(higher_root_byte));
+
+                if lower_slot_data.tree_hash_root() > higher_slot_data.tree_hash_root() {
+                    return (lower_slot_data, higher_slot_data);
+                }
+            }
+        }
+
+        panic!("failed to find a lower-slot attestation with larger data root")
+    }
+
+    async fn extract_equivocating_attestation(
+        first: AttestationData,
+        second: AttestationData,
+    ) -> anyhow::Result<AttestationData> {
+        let store = sample_store_as_store(10).await;
+        let first_root = first.tree_hash_root();
+        let second_root = second.tree_hash_root();
+
+        {
+            let attestation_data_by_root_provider =
+                store.store.lock().await.attestation_data_by_root_provider();
+            attestation_data_by_root_provider.insert(first_root, first)?;
+            attestation_data_by_root_provider.insert(second_root, second)?;
+        }
+
+        let mut aggregated_payloads = HashMap::new();
+        aggregated_payloads.insert(
+            SignatureKey::from_parts(0, first_root),
+            vec![make_test_aggregated_proof(&[0])],
+        );
+        aggregated_payloads.insert(
+            SignatureKey::from_parts(0, second_root),
+            vec![make_test_aggregated_proof(&[0])],
+        );
+
+        store
+            .extract_attestations_from_aggregated_payloads(&aggregated_payloads)
+            .await?
+            .remove(&0)
+            .ok_or_else(|| anyhow::anyhow!("missing extracted attestation"))
+    }
+
+    async fn import_empty_block(
+        store: &mut Store,
+        slot: u64,
+        proposer_index: u64,
+        parent_root: B256,
+    ) -> anyhow::Result<B256> {
+        let time_provider = { store.store.lock().await.time_provider() };
+        time_provider.insert(slot * INTERVALS_PER_SLOT)?;
+
+        let mut block = Block {
+            slot,
+            proposer_index,
+            parent_root,
+            state_root: B256::ZERO,
+            body: BlockBody {
+                attestations: VariableList::empty(),
+            },
+        };
+
+        let mut post_state = store
+            .store
+            .lock()
+            .await
+            .state_provider()
+            .get(parent_root)?
+            .ok_or_else(|| anyhow::anyhow!("missing parent state"))?;
+        post_state.process_slots(slot)?;
+        post_state.process_block(&block)?;
+        block.state_root = post_state.tree_hash_root();
+
+        let block_root = block.tree_hash_root();
+        let signed_block = SignedBlock {
+            block,
+            proof: MultiMessageAggregate::default(),
+        };
+
+        store.on_block(&signed_block, false).await?;
+        Ok(block_root)
+    }
+
+    async fn head_after_equivocating_votes(
+        fork_a_first: bool,
+    ) -> anyhow::Result<(B256, B256, B256)> {
+        let mut store = sample_store_as_store(6).await;
+        let genesis_root = { store.store.lock().await.head_provider().get()? };
+        let common_root = import_empty_block(&mut store, 1, 1, genesis_root).await?;
+        let fork_a_root = import_empty_block(&mut store, 2, 2, common_root).await?;
+        let fork_b_root = import_empty_block(&mut store, 3, 3, common_root).await?;
+
+        let fork_b_vote = make_attestation_data_with_root(3, 3, fork_b_root);
+        let fork_b_vote_root = fork_b_vote.tree_hash_root();
+        let mut fork_a_vote = make_attestation_data_with_root(3, 2, fork_a_root);
+
+        for source_root_suffix in 0u16..=u16::MAX {
+            let mut source_root = B256::ZERO;
+            source_root[30..32].copy_from_slice(&source_root_suffix.to_be_bytes());
+            fork_a_vote.source.root = source_root;
+            if fork_a_vote.tree_hash_root() > fork_b_vote_root {
+                break;
+            }
+        }
+        assert!(fork_a_vote.tree_hash_root() > fork_b_vote_root);
+
+        let first_vote = if fork_a_first {
+            fork_a_vote.clone()
+        } else {
+            fork_b_vote.clone()
+        };
+        let second_vote = if fork_a_first {
+            fork_b_vote
+        } else {
+            fork_a_vote
+        };
+
+        {
+            let db = store.store.lock().await;
+            let attestation_data_by_root_provider = db.attestation_data_by_root_provider();
+            let latest_known_aggregated_payloads_provider =
+                db.latest_known_aggregated_payloads_provider();
+
+            for vote in [first_vote, second_vote] {
+                let data_root = vote.tree_hash_root();
+                attestation_data_by_root_provider.insert(data_root, vote)?;
+                latest_known_aggregated_payloads_provider.insert(
+                    SignatureKey::from_parts(0, data_root),
+                    vec![make_test_aggregated_proof(&[0])],
+                )?;
+            }
+        }
+
+        let extracted_vote = {
+            let aggregated_payloads = store
+                .store
+                .lock()
+                .await
+                .latest_known_aggregated_payloads_provider()
+                .iter()?
+                .into_iter()
+                .collect();
+            store
+                .extract_attestations_from_aggregated_payloads(&aggregated_payloads)
+                .await?
+                .remove(&0)
+                .ok_or_else(|| anyhow::anyhow!("missing extracted equivocation vote"))?
+        };
+        assert_eq!(extracted_vote.head.root, fork_a_root);
+
+        store.update_head().await?;
+        let actual_head = { store.store.lock().await.head_provider().get()? };
+
+        Ok((actual_head, fork_a_root, fork_a_root))
+    }
+
+    #[tokio::test]
+    async fn test_equal_slot_equivocation_resolves_to_larger_data_root() -> anyhow::Result<()> {
+        let (lower_root_data, higher_root_data) = ordered_by_data_root(5, 5);
+
+        let forward =
+            extract_equivocating_attestation(lower_root_data.clone(), higher_root_data.clone())
+                .await?;
+        let reverse =
+            extract_equivocating_attestation(higher_root_data.clone(), lower_root_data).await?;
+
+        assert_eq!(forward, higher_root_data);
+        assert_eq!(reverse, higher_root_data);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_higher_slot_beats_larger_data_root() -> anyhow::Result<()> {
+        let (lower_slot_larger_root, higher_slot_smaller_root) = lower_slot_larger_root_pair();
+
+        let extracted = extract_equivocating_attestation(
+            lower_slot_larger_root,
+            higher_slot_smaller_root.clone(),
+        )
+        .await?;
+
+        assert_eq!(extracted, higher_slot_smaller_root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_equivocation_head_independent_of_arrival_order_a_then_b() -> anyhow::Result<()> {
+        let (head, expected_head, fork_a_root) = head_after_equivocating_votes(true).await?;
+
+        assert_eq!(expected_head, fork_a_root);
+        assert_eq!(head, expected_head);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_equivocation_head_independent_of_arrival_order_b_then_a() -> anyhow::Result<()> {
+        let (head, expected_head, fork_a_root) = head_after_equivocating_votes(false).await?;
+
+        assert_eq!(expected_head, fork_a_root);
+        assert_eq!(head, expected_head);
+        Ok(())
+    }
 }
