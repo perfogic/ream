@@ -1,14 +1,13 @@
-use anyhow::ensure;
+pub fn is_justifiable_after(candidate_slot: u64, finalized_slot: u64) -> bool {
+    if candidate_slot < finalized_slot {
+        return false;
+    }
 
-pub fn is_justifiable_after(candidate_slot: u64, finalized_slot: u64) -> anyhow::Result<bool> {
-    ensure!(
-        candidate_slot >= finalized_slot,
-        "Candidate slot ({candidate_slot}) must be more than or equal to finalized slot ({finalized_slot})"
-    );
     let delta = candidate_slot - finalized_slot;
-    Ok(delta <= 5
+    let pentagonal_test = 4u128 * u128::from(delta) + 1;
+    delta <= 5
         || delta.isqrt().pow(2) == delta
-        || (4 * delta + 1).isqrt().pow(2) == 4 * delta + 1 && (4 * delta + 1).isqrt() % 2 == 1)
+        || pentagonal_test.isqrt().pow(2) == pentagonal_test && pentagonal_test.isqrt() % 2 == 1
 }
 
 pub fn justified_index_after(candidate_slot: u64, finalized_slot: u64) -> Option<u64> {
@@ -17,4 +16,15 @@ pub fn justified_index_after(candidate_slot: u64, finalized_slot: u64) -> Option
     }
 
     Some(candidate_slot - finalized_slot - 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_justifiable_after;
+
+    #[test]
+    fn justifiability_is_false_before_finalized_slot() {
+        assert!(!is_justifiable_after(9, 10));
+        assert!(!is_justifiable_after(90, 100));
+    }
 }

@@ -541,7 +541,7 @@ impl Store {
                 .block
                 .slot,
             latest_finalized_slot,
-        )? {
+        ) {
             target_block_root = block_provider
                 .get(target_block_root)?
                 .ok_or(anyhow!("Block not found for target block root"))?
@@ -4478,7 +4478,7 @@ mod tests {
                 .slot
         };
 
-        assert!(is_justifiable_after(target.slot, finalized_slot).unwrap());
+        assert!(is_justifiable_after(target.slot, finalized_slot));
     }
 
     /// Target should be on the path from head to finalized checkpoint.
@@ -5140,7 +5140,7 @@ mod tests {
         let finalized_slot = latest_finalized_provider.get().unwrap().slot;
 
         assert!(block_provider.contains_key(target.root));
-        assert!(is_justifiable_after(target.slot, finalized_slot).unwrap());
+        assert!(is_justifiable_after(target.slot, finalized_slot));
     }
 
     /// Attestation target computation should work with single validator.
@@ -5294,6 +5294,6 @@ mod tests {
         let finalized_slot = latest_finalized_provider.get().unwrap().slot;
 
         assert!(block_provider.contains_key(target.root));
-        assert!(is_justifiable_after(target.slot, finalized_slot).unwrap());
+        assert!(is_justifiable_after(target.slot, finalized_slot));
     }
 }

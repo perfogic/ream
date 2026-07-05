@@ -297,9 +297,17 @@ impl LeanState {
 
         let mut justifications_map = HashMap::new();
 
-        if !self.justifications_roots.is_empty() {
-            let validator_count = self.validators.len();
+        let validator_count = self.validators.len();
+        let expected_justification_votes = self.justifications_roots.len() * validator_count;
+        let actual_justification_votes = self.justifications_validators.len();
+        ensure!(
+            actual_justification_votes == expected_justification_votes,
+            "justifications_validators length mismatch: expected {expected_justification_votes} \
+             bits ({} roots x {validator_count} validators), got {actual_justification_votes}",
+            self.justifications_roots.len(),
+        );
 
+        if !self.justifications_roots.is_empty() {
             let flat_votes = self.justifications_validators.iter().collect::<Vec<_>>();
 
             for (i, root) in self.justifications_roots.iter().enumerate() {
@@ -410,7 +418,7 @@ impl LeanState {
                 continue;
             }
 
-            if !is_justifiable_after(attestation.target().slot, self.latest_finalized.slot)? {
+            if !is_justifiable_after(attestation.target().slot, self.latest_finalized.slot) {
                 info!(
                     reason = "Target slot not justifiable",
                     source_slot = attestation.source().slot,
@@ -482,9 +490,8 @@ impl LeanState {
                 // hash after the source
                 let is_target_next_valid_justifiable_slot = attestation.source().slot
                     > self.latest_finalized.slot
-                    && !((attestation.source().slot + 1)..attestation.target().slot).any(|slot| {
-                        is_justifiable_after(slot, self.latest_finalized.slot).unwrap_or(false)
-                    });
+                    && !((attestation.source().slot + 1)..attestation.target().slot)
+                        .any(|slot| is_justifiable_after(slot, self.latest_finalized.slot));
 
                 if is_target_next_valid_justifiable_slot {
                     let delta = (attestation.source().slot - self.latest_finalized.slot) as usize;
