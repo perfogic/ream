@@ -2340,14 +2340,15 @@ impl Store {
             )
         };
 
-        let mut aggregated_data_roots = HashSet::new();
+        let mut aggregated_signature_keys = HashSet::new();
         let mut next_new_payloads: HashMap<SignatureKey, Vec<PayloadProof>> = HashMap::new();
         for signed_attestation in signed_attestations {
             let data_root = signed_attestation.data.tree_hash_root();
-            aggregated_data_roots.insert(data_root);
             for validator_id in signed_attestation.proof.to_validator_indices() {
+                let signature_key = SignatureKey::from_parts(validator_id, data_root);
+                aggregated_signature_keys.insert(signature_key.clone());
                 next_new_payloads
-                    .entry(SignatureKey::from_parts(validator_id, data_root))
+                    .entry(signature_key)
                     .or_default()
                     .push(signed_attestation.proof.clone());
             }
@@ -2365,8 +2366,7 @@ impl Store {
             latest_new_aggregated_payloads_provider.insert(key, existing)?;
         }
 
-        attestation_signatures_provider
-            .retain(|key| !aggregated_data_roots.contains(&key.data_root))?;
+        attestation_signatures_provider.retain(|key| !aggregated_signature_keys.contains(key))?;
 
         Ok(())
     }
@@ -2702,14 +2702,17 @@ fn shift_projected_finalized_slot(
 mod tests {
     use alloy_primitives::B256;
     use ream_consensus_lean::{
-        attestation::{AttestationData, MultiMessageAggregate, SignedAttestation},
+        attestation::{
+            AttestationData, MultiMessageAggregate, SignatureKey, SignedAggregatedAttestation,
+            SignedAttestation, SingleMessageAggregate,
+        },
         block::{Block, BlockBody, SignedBlock},
         checkpoint::Checkpoint,
     };
     use ream_post_quantum_crypto::leansig::signature::Signature;
     use ream_storage::tables::{field::REDBField, table::REDBTable};
     use ream_test_utils::store::sample_store;
-    use ssz_types::VariableList;
+    use ssz_types::{BitList, VariableList, typenum::U4096};
     use tree_hash::TreeHash;
 
     use super::{BlockProductionStrategy, Store};
@@ -2856,5 +2859,65 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_aggregate_apply_preserves_raw_signatures_not_covered_by_proof() {
+        let store = sample_store_as_store(2).await;
+        let genesis_root = store.store.lock().await.head_provider().get().unwrap();
+        let data = AttestationData {
+            slot: 1,
+            head: Checkpoint {
+                root: genesis_root,
+                slot: 0,
+            },
+            target: Checkpoint {
+                root: genesis_root,
+                slot: 0,
+            },
+            source: Checkpoint {
+                root: genesis_root,
+                slot: 0,
+            },
+        };
+        let data_root = data.tree_hash_root();
+        let validator_0_key = SignatureKey::from_parts(0, data_root);
+        let validator_1_key = SignatureKey::from_parts(1, data_root);
+
+        {
+            let db = store.store.lock().await;
+            db.attestation_data_by_root_provider()
+                .insert(data_root, data.clone())
+                .unwrap();
+            db.attestation_signatures_provider()
+                .insert(validator_0_key.clone(), Signature::blank())
+                .unwrap();
+        }
+
+        let jobs = store.aggregate_prepare().await.unwrap();
+        assert_eq!(jobs.len(), 1);
+
+        store
+            .store
+            .lock()
+            .await
+            .attestation_signatures_provider()
+            .insert(validator_1_key.clone(), Signature::blank())
+            .unwrap();
+
+        let mut participants = BitList::<U4096>::with_capacity(2).unwrap();
+        participants.set(0, true).unwrap();
+        let aggregate = SignedAggregatedAttestation {
+            data,
+            proof: SingleMessageAggregate::new(participants, VariableList::default()),
+        };
+        store.aggregate_apply(&[aggregate]).await.unwrap();
+
+        let signatures = store.store.lock().await.attestation_signatures_provider();
+        assert!(signatures.get(validator_0_key).unwrap().is_none());
+        assert!(
+            signatures.get(validator_1_key).unwrap().is_some(),
+            "a signature that arrived after prepare must survive apply"
+        );
     }
 }
